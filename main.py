@@ -10,11 +10,13 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT']
+# ================== НАСТРОЙКИ ==================
+MAX_WORKERS = 16                    # количество параллельных worker'ов
+SCAN_INTERVAL = 20                  # секунд между полными сканами
+ALERT_COOLDOWN = 60 * 60            # 1 час между алертами по одному символу
 
-history = {symbol: deque(maxlen=30) for symbol in SYMBOLS}
-last_alert_time = {}        # когда последний раз присылали алерт
-active_signals = {}         # запоминаем активные сетапы
+history = {}
+last_alert = {}
 
 async def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -28,83 +30,90 @@ async def send_telegram(message: str):
     except:
         pass
 
-class BinanceClient:
-    BASE_URL = "https://fapi.binance.com"
+async def fetch_symbol_data(client, symbol):
+    try:
+        # Open Interest
+        oi_resp = await client.get(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}")
+        oi = float(oi_resp.json().get("openInterest", 0))
 
-    async def get_data(self, symbol: str):
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            try:
-                oi_resp = await client.get(f"{self.BASE_URL}/fapi/v1/openInterest?symbol={symbol}")
-                oi = float(oi_resp.json().get("openInterest", 0))
+        # Ticker
+        ticker_resp = await client.get(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={symbol}")
+        t = ticker_resp.json()
 
-                ticker_resp = await client.get(f"{self.BASE_URL}/fapi/v1/ticker/24hr?symbol={symbol}")
-                t = ticker_resp.json()
+        return {
+            "symbol": symbol,
+            "price": float(t.get("lastPrice", 0)),
+            "open_interest": oi,
+            "volume": float(t.get("volume", 0)),
+            "price_change": float(t.get("priceChangePercent", 0)),
+            "timestamp": datetime.now()
+        }
+    except:
+        return None
 
-                return {
-                    "symbol": symbol,
-                    "price": float(t.get("lastPrice", 0)),
-                    "open_interest": oi,
-                    "volume": float(t.get("volume", 0)),
-                    "price_change": float(t.get("priceChangePercent", 0)),
-                }
-            except:
-                return None
-
-def is_flat_base_with_oi_growth(symbol_data):
-    if len(symbol_data) < 12:
+def is_flat_base_pattern(data_history):
+    if len(data_history) < 15:
         return False
 
-    prices = [d['price'] for d in symbol_data]
-    oi_list = [d['open_interest'] for d in symbol_data]
+    prices = [d['price'] for d in data_history]
+    oi_list = [d['open_interest'] for d in data_history]
 
-    price_range = (max(prices) - min(prices)) / min(prices) * 100
-    oi_growth = (oi_list[-1] - oi_list[0]) / oi_list[0] * 100 if oi_list[0] > 0 else 0
+    price_range_pct = (max(prices) - min(prices)) / min(prices) * 100
+    oi_growth_pct = (oi_list[-1] - oi_list[0]) / oi_list[0] * 100 if oi_list[0] > 0 else 0
 
     return (
-        price_range < 2.8 and           # плоская база
-        5 < oi_growth < 28 and         # умеренный рост OI
-        abs(symbol_data[-1]['price_change']) < 1.6
+        price_range_pct < 2.6 and      # плоская база
+        6 < oi_growth_pct < 25 and     # умеренный рост OI
+        abs(data_history[-1]['price_change']) < 1.7
     )
 
-async def main():
-    print(f"[{datetime.now()}] Scanner запущен с маркировкой сигналов")
+async def worker(client, symbol, semaphore):
+    async with semaphore:
+        data = await fetch_symbol_data(client, symbol)
+        if not data:
+            return
 
-    client = BinanceClient()
+        if symbol not in history:
+            history[symbol] = deque(maxlen=30)
+        history[symbol].append(data)
 
-    while True:
-        for symbol in SYMBOLS:
-            data = await client.get_data(symbol)
-            if not data:
-                continue
+        if is_flat_base_pattern(history[symbol]):
+            now = datetime.now().timestamp()
+            if symbol not in last_alert or (now - last_alert.get(symbol, 0)) > ALERT_COOLDOWN:
+                last_alert[symbol] = now
 
-            history[symbol].append(data)
-
-            # Проверяем условие
-            if is_flat_base_with_oi_growth(history[symbol]):
-                now = datetime.now()
-
-                # Проверяем, не отправляли ли мы уже алерт по этому символу недавно
-                last = last_alert_time.get(symbol)
-                if not last or (now - last) > timedelta(minutes=60):   # 1 раз в час
-                    last_alert_time[symbol] = now
-
-                    alert = f"""
+                alert = f"""
 🔥 <b>Зарождение движения!</b>
 
 📍 <b>{symbol}</b>
 💰 Цена: <code>{data['price']:.2f}</code>
 📊 OI: <code>{data['open_interest']:,.0f}</code>
-📉 Диапазон цены: <code>{(max(p['price'] for p in history[symbol]) - min(p['price'] for p in history[symbol])) / min(p['price'] for p in history[symbol]) * 100:.2f}%</code>
-⏰ {now.strftime('%H:%M:%S')}
-                    """.strip()
+📉 Диапазон: <code>{(max(p['price'] for p in history[symbol]) - min(p['price'] for p in history[symbol])) / min(p['price'] for p in history[symbol]) * 100:.2f}%</code>
+⏰ {datetime.now().strftime('%H:%M:%S')}
+                """.strip()
 
-                    await send_telegram(alert)
-                    print(f"✅ АЛЕРТ отправлен → {symbol}")
+                await send_telegram(alert)
+                print(f"✅ АЛЕРТ → {symbol}")
 
-            print(f"{symbol:>8} | OI: {data['open_interest']:>12,.0f} | Price: {data['price']:>8.2f} | Chg: {data['price_change']:>6.2f}%")
+        print(f"{symbol:>10} | OI: {data['open_interest']:>12,.0f} | Price: {data['price']:>8.2f} | Chg: {data['price_change']:>6.2f}%")
 
-        print("-" * 90)
-        await asyncio.sleep(25)
+async def main():
+    print(f"[{datetime.now()}] Scanner запущен | Workers: {MAX_WORKERS} | Интервал: {SCAN_INTERVAL} сек")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Получаем список всех USDT-M фьючерсов
+        resp = await client.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
+        all_symbols = [s['symbol'] for s in resp.json()['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+
+        print(f"Найдено {len(all_symbols)} торговых пар. Начинаем мониторинг...\n")
+
+        semaphore = asyncio.Semaphore(MAX_WORKERS)
+
+        while True:
+            tasks = [worker(client, symbol, semaphore) for symbol in all_symbols]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            print(f"\n[{datetime.now()}] Полный цикл завершён. Следующий через {SCAN_INTERVAL} сек...\n")
+            await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(main())
